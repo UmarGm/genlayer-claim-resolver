@@ -57,7 +57,7 @@ def test_different_final_rejected():
     assert not results_equivalent(leader, mine)
 
 
-def test_two_sources_differ_rejected_even_if_final_same():
+def test_two_sources_differ_rejected():
     leader = res(["YES", "YES", "YES", "YES", "YES"])
     mine = res(["YES", "YES", "YES", "UNDETERMINED", "UNDETERMINED"])
     # mine is UNRESOLVED anyway, but also checks the mismatch limit
