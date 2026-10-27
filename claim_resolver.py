@@ -1,7 +1,7 @@
 # { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
 from genlayer import *
 
-import json 
+import json
 from dataclasses import dataclass
 
 """
@@ -23,12 +23,22 @@ Consensus design (the interesting part):
          load or one borderline LLM answer, but not a different outcome).
   * No quorum of sources -> UNRESOLVED instead of a guess. After MAX_ATTEMPTS
     unresolved attempts the claim is closed, so state cannot flip-flop forever.
+
+v2 additions:
+  * Source independence: every source must come from a DIFFERENT domain, so
+    five pages of one website can no longer pose as five independent sources.
+  * challenge(): the creator of a claim that closed as CLOSED_UNRESOLVED may
+    add 1-3 extra sources from NEW domains (once per claim, max 7 sources in
+    total) and re-open it for another round of attempts.
 """
 
 # --- pure logic begin ---
 VALID_VERDICTS = ("YES", "NO", "UNDETERMINED")
 MIN_SOURCES = 2
 MAX_SOURCES = 5
+MAX_EXTRA_SOURCES = 3
+MAX_TOTAL_SOURCES = 7
+MAX_CHALLENGES = 1
 MAX_ATTEMPTS = 3
 MAX_QUESTION_LEN = 300
 MAX_PAGE_CHARS = 6000
@@ -71,6 +81,17 @@ def results_equivalent(leader: dict, mine: dict, tolerance: int = 1) -> bool:
     return mismatches <= tolerance
 
 
+def host_of(url: str) -> str:
+    """Lower-cased host of an https URL, without 'www.', port or credentials."""
+    rest = url[len("https://"):] if url.startswith("https://") else url
+    for sep in ("/", "?", "#"):
+        rest = rest.split(sep)[0]
+    rest = rest.split("@")[-1].split(":")[0].lower()
+    if rest.startswith("www."):
+        rest = rest[4:]
+    return rest
+
+
 def validate_inputs(question: str, sources: list):
     """Returns an error message, or None when the input is acceptable."""
     if not isinstance(question, str) or not question.strip():
@@ -86,6 +107,33 @@ def validate_inputs(question: str, sources: list):
     for url in sources:
         if not isinstance(url, str) or not url.startswith("https://"):
             return "every source must be an https:// URL"
+    hosts = [host_of(u) for u in sources]
+    if any(h == "" for h in hosts):
+        return "every source must have a domain"
+    if len(set(hosts)) != len(hosts):
+        return "sources must come from different domains"
+    return None
+
+
+def validate_challenge(existing: list, extra: list):
+    """Checks the extra sources a creator adds when challenging a claim."""
+    if not isinstance(extra, list):
+        return "extra sources must be a list"
+    if not (1 <= len(extra) <= MAX_EXTRA_SOURCES):
+        return "provide between 1 and 3 extra sources"
+    if len(existing) + len(extra) > MAX_TOTAL_SOURCES:
+        return "a claim can have at most 7 sources in total"
+    for url in extra:
+        if not isinstance(url, str) or not url.startswith("https://"):
+            return "every source must be an https:// URL"
+    seen = [host_of(u) for u in existing]
+    for url in extra:
+        host = host_of(url)
+        if host == "":
+            return "every source must have a domain"
+        if host in seen:
+            return "extra sources must come from new domains"
+        seen.append(host)
     return None
 # --- pure logic end ---
 
@@ -122,11 +170,12 @@ Respond with JSON only: {{"verdict": "YES" | "NO" | "UNDETERMINED"}}"""
 class Claim:
     creator: Address
     question: str
-    sources_json: str      # JSON list of https URLs, fixed at creation
+    sources_json: str      # JSON list of https URLs (grows only via challenge)
     status: str            # OPEN -> RESOLVED | CLOSED_UNRESOLVED
     verdict: str           # "" while OPEN, then YES | NO | UNRESOLVED
     verdicts_json: str     # JSON list of per-source verdicts of last attempt
     attempts: u256
+    challenges: u256       # how many times the creator re-opened the claim
 
 
 class ClaimResolver(gl.Contract):
@@ -153,6 +202,7 @@ class ClaimResolver(gl.Contract):
             verdict="",
             verdicts_json="[]",
             attempts=u256(0),
+            challenges=u256(0),
         )
         self.next_id = claim_id + u256(1)
         return int(claim_id)
@@ -190,6 +240,35 @@ class ClaimResolver(gl.Contract):
             claim.status = "CLOSED_UNRESOLVED"
         return outcome["final"]
 
+    @gl.public.write
+    def challenge(self, claim_id: int, extra_sources: list[str]) -> int:
+        """Creator adds 1-3 sources from new domains to a claim that closed
+        without a verdict, and re-opens it. Returns the new source count."""
+        cid = u256(claim_id)
+        if cid not in self.claims:
+            raise gl.vm.UserError("claim not found")
+        claim = self.claims[cid]
+        if claim.creator != gl.message.sender_address:
+            raise gl.vm.UserError("only the claim creator can challenge")
+        if claim.status != "CLOSED_UNRESOLVED":
+            raise gl.vm.UserError("only a claim closed as unresolved can be challenged")
+        if int(claim.challenges) >= MAX_CHALLENGES:
+            raise gl.vm.UserError("challenge limit reached")
+
+        existing = json.loads(claim.sources_json)
+        error = validate_challenge(existing, extra_sources)
+        if error is not None:
+            raise gl.vm.UserError(error)
+
+        merged = existing + list(extra_sources)
+        claim.sources_json = json.dumps(merged)
+        claim.status = "OPEN"
+        claim.verdict = ""
+        claim.verdicts_json = "[]"
+        claim.attempts = u256(0)
+        claim.challenges = claim.challenges + u256(1)
+        return len(merged)
+
     # ---------- views ----------
 
     @gl.public.view
@@ -206,6 +285,7 @@ class ClaimResolver(gl.Contract):
             "verdict": c.verdict,
             "source_verdicts": json.loads(c.verdicts_json),
             "attempts": int(c.attempts),
+            "challenges": int(c.challenges),
         }
 
     @gl.public.view
